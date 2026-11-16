@@ -1,130 +1,90 @@
-// Sky Jellyfish — make.fun ai-excited-01 entry (Node 22, standard library only).
-//
-// entry.png sits next to this file (JPEG bytes under a .png name; the gate
-// sniffs the format from the first bytes, so that is fine). This script
-// copies those bytes verbatim into the output directory, then proves the
-// copy is good: it reads the output back, checks every byte matches the
-// source, and checks the size stays within the 1 MiB gate limit. A plain
-// byte copy plus a read-back check means two runs always agree.
-//
-// Run it outside the grader's container with:
-//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-
-const MAX_BYTES = 1024 * 1024;
+const MAX_BYTES = 1048576;
 const MAX_SIDE = 1024;
 
-const here = dirname(fileURLToPath(import.meta.url));
-const sourcePath = join(here, 'entry.png');
-const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-const outPath = join(outDir, 'entry.png');
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const JPEG_MAGIC = Buffer.from([0xff, 0xd8, 0xff]);
 
 function fail(message: string): never {
-  throw new Error(message);
+  console.error(`error: ${message}`);
+  process.exit(1);
 }
 
-function readDimensions(bytes: Buffer): { width: number; height: number } {
-  const isPng =
-    bytes.length > 8 &&
-    bytes[0] === 0x89 &&
-    bytes[1] === 0x50 &&
-    bytes[2] === 0x4e &&
-    bytes[3] === 0x47;
-  const isJpeg =
-    bytes.length > 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
-
-  if (!isPng && !isJpeg) {
-    fail('entry.png is neither PNG nor JPEG (checked by magic bytes)');
+function pngSize(buf: Buffer): { width: number; height: number } {
+  if (buf.length < 24 || buf.toString("ascii", 12, 16) !== "IHDR") {
+    fail("PNG header is truncated or missing IHDR");
   }
-  if (isJpeg && (bytes[bytes.length - 2] !== 0xff || bytes[bytes.length - 1] !== 0xd9)) {
-    fail('JPEG entry is truncated: missing the end-of-image marker');
-  }
+  return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+}
 
-  if (isPng) {
-    return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) };
-  }
-
-  // JPEG: walk the markers until a frame header (SOF0/SOF2) gives the size.
+function jpegSize(buf: Buffer): { width: number; height: number } {
   let pos = 2;
-  while (pos + 9 < bytes.length) {
-    if (bytes[pos] !== 0xff) {
+  while (pos + 9 <= buf.length) {
+    if (buf[pos] !== 0xff) fail("JPEG segment marker expected while scanning for size");
+    let marker = buf[pos + 1];
+    while (marker === 0xff) {
       pos += 1;
-      continue;
-    }
-    const marker = bytes[pos + 1];
-    if (marker === 0xc0 || marker === 0xc2) {
-      return { width: bytes.readUInt16BE(pos + 7), height: bytes.readUInt16BE(pos + 5) };
+      marker = buf[pos + 1];
     }
     if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
       pos += 2;
       continue;
     }
-    pos += 2 + bytes.readUInt16BE(pos + 2);
+    if (marker === 0xda) fail("JPEG size frame not found before image data");
+    if (pos + 4 > buf.length) fail("JPEG segment is truncated");
+    const len = buf.readUInt16BE(pos + 2);
+    if (len < 2 || pos + 2 + len > buf.length) fail("JPEG segment length is out of range");
+    if ((marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc)) {
+      if (len < 7) fail("JPEG size frame is too short");
+      return { height: buf.readUInt16BE(pos + 5), width: buf.readUInt16BE(pos + 7) };
+    }
+    pos += 2 + len;
   }
-  fail('could not read the entry image dimensions');
-}
-
-// After writing, read the output back and prove it is the same file:
-// same length, same bytes, same dimensions, and still inside the gate's
-// size limit. Byte equality alone would catch most bad writes; checking
-// the dimensions too catches a write that got the right length but the
-// wrong content in its header.
-function verifyOutput(source: Buffer, path: string, width: number, height: number): void {
-  if (!existsSync(path)) {
-    fail(`verification failed: output file was not created at ${path}`);
-  }
-  const written = readFileSync(path);
-  if (written.length > MAX_BYTES) {
-    fail(`verification failed: output is ${written.length} bytes, over the ${MAX_BYTES} byte limit`);
-  }
-  if (written.length !== source.length) {
-    fail(
-      `verification failed: output is ${written.length} bytes but the source is ${source.length} bytes`,
-    );
-  }
-  if (!written.equals(source)) {
-    fail('verification failed: output bytes differ from the source image');
-  }
-  const outDims = readDimensions(written);
-  if (outDims.width !== width || outDims.height !== height) {
-    fail(
-      `verification failed: output is ${outDims.width}x${outDims.height}, ` +
-        `expected ${width}x${height}`,
-    );
-  }
+  fail("JPEG size frame not found");
 }
 
 function main(): void {
-  if (!existsSync(sourcePath)) {
-    fail(`entry image missing: ${sourcePath}`);
-  }
+  const here = dirname(fileURLToPath(import.meta.url));
+  const source = join(here, "entry.png");
+  if (!existsSync(source)) fail(`entry.png not found next to main.ts (${source})`);
 
-  const bytes = readFileSync(sourcePath);
+  const bytes = readFileSync(source);
+  if (bytes.length === 0) fail("entry.png is empty");
   if (bytes.length > MAX_BYTES) {
-    fail(`entry.png is ${bytes.length} bytes, over the ${MAX_BYTES} byte limit`);
+    fail(`entry.png is ${bytes.length} bytes, over the 1048576 byte limit`);
   }
 
-  const { width, height } = readDimensions(bytes);
-  if (width === 0 || height === 0) {
-    fail('could not read the entry image dimensions');
+  let kind: string;
+  let size: { width: number; height: number };
+  if (bytes.subarray(0, 8).equals(PNG_MAGIC)) {
+    kind = "PNG";
+    size = pngSize(bytes);
+  } else if (bytes.subarray(0, 3).equals(JPEG_MAGIC)) {
+    kind = "JPEG";
+    if (bytes[bytes.length - 2] !== 0xff || bytes[bytes.length - 1] !== 0xd9) {
+      fail("JPEG data is missing its end marker (FF D9)");
+    }
+    size = jpegSize(bytes);
+  } else {
+    fail("entry.png is neither PNG nor JPEG (magic bytes do not match)");
   }
-  if (width > MAX_SIDE || height > MAX_SIDE) {
-    fail(`entry image is ${width}x${height}, over the ${MAX_SIDE}x${MAX_SIDE} limit`);
+  if (size.width <= 0 || size.height <= 0) fail(`bad image size ${size.width}x${size.height}`);
+  if (size.width > MAX_SIDE || size.height > MAX_SIDE) {
+    fail(`image is ${size.width}x${size.height}, over the 1024x1024 limit`);
   }
 
+  const outDir = process.env.MAKEFUN_OUTPUT_DIR || "/output";
   mkdirSync(outDir, { recursive: true });
-  writeFileSync(outPath, bytes);
+  const dest = join(outDir, "entry.png");
+  writeFileSync(dest, bytes);
 
-  verifyOutput(bytes, outPath, width, height);
-  console.log(`wrote ${outPath} (${width}x${height}, ${bytes.length} bytes) — verified byte-identical`);
+  const back = readFileSync(dest);
+  if (!back.equals(bytes)) fail("output differs from entry.png after writing");
+
+  console.log(`entry.png: ${size.width}x${size.height} ${kind} ${bytes.length} bytes -> ${dest}`);
 }
 
-try {
-  main();
-} catch (error) {
-  console.error(`error: ${error instanceof Error ? error.message : String(error)}`);
-  process.exit(1);
-}
+main();
