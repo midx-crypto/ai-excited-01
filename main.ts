@@ -1,90 +1,87 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const MAX_BYTES = 1048576;
-const MAX_SIDE = 1024;
-
-const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-const JPEG_MAGIC = Buffer.from([0xff, 0xd8, 0xff]);
+const MAX_DIM = 1024;
 
 function fail(message: string): never {
   console.error(`error: ${message}`);
   process.exit(1);
 }
 
-function pngSize(buf: Buffer): { width: number; height: number } {
-  if (buf.length < 24 || buf.toString("ascii", 12, 16) !== "IHDR") {
-    fail("PNG header is truncated or missing IHDR");
-  }
+function pngDimensions(buf: Buffer): { width: number; height: number } | null {
+  if (buf.length < 33) return null;
+  if (buf.readUInt32BE(12) !== 0x49484452) return null; // "IHDR"
   return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
 }
 
-function jpegSize(buf: Buffer): { width: number; height: number } {
-  let pos = 2;
-  while (pos + 9 <= buf.length) {
-    if (buf[pos] !== 0xff) fail("JPEG segment marker expected while scanning for size");
-    let marker = buf[pos + 1];
-    while (marker === 0xff) {
-      pos += 1;
-      marker = buf[pos + 1];
-    }
+function jpegDimensions(buf: Buffer): { width: number; height: number } | null {
+  let i = 2;
+  while (i + 9 < buf.length) {
+    if (buf[i] !== 0xff) return null;
+    const marker = buf[i + 1];
     if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
-      pos += 2;
+      i += 2;
       continue;
     }
-    if (marker === 0xda) fail("JPEG size frame not found before image data");
-    if (pos + 4 > buf.length) fail("JPEG segment is truncated");
-    const len = buf.readUInt16BE(pos + 2);
-    if (len < 2 || pos + 2 + len > buf.length) fail("JPEG segment length is out of range");
-    if ((marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc)) {
-      if (len < 7) fail("JPEG size frame is too short");
-      return { height: buf.readUInt16BE(pos + 5), width: buf.readUInt16BE(pos + 7) };
+    const len = buf.readUInt16BE(i + 2);
+    if (len < 2 || i + 2 + len > buf.length) return null;
+    if (
+      marker === 0xc0 || marker === 0xc1 || marker === 0xc2 || marker === 0xc3 ||
+      marker === 0xc5 || marker === 0xc6 || marker === 0xc7 ||
+      marker === 0xc9 || marker === 0xca || marker === 0xcb ||
+      marker === 0xcd || marker === 0xce || marker === 0xcf
+    ) {
+      return { height: buf.readUInt16BE(i + 5), width: buf.readUInt16BE(i + 7) };
     }
-    pos += 2 + len;
+    i += 2 + len;
   }
-  fail("JPEG size frame not found");
+  return null;
 }
 
-function main(): void {
-  const here = dirname(fileURLToPath(import.meta.url));
-  const source = join(here, "entry.png");
-  if (!existsSync(source)) fail(`entry.png not found next to main.ts (${source})`);
-
-  const bytes = readFileSync(source);
-  if (bytes.length === 0) fail("entry.png is empty");
-  if (bytes.length > MAX_BYTES) {
-    fail(`entry.png is ${bytes.length} bytes, over the 1048576 byte limit`);
+function describe(buf: Buffer): { kind: string; width: number; height: number } {
+  const isPng = buf.length >= 8 && buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  const isJpeg = buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
+  if (isPng) {
+    const d = pngDimensions(buf);
+    if (!d) fail("entry.png is not a whole PNG: IHDR missing or truncated");
+    return { kind: "PNG", ...d };
   }
-
-  let kind: string;
-  let size: { width: number; height: number };
-  if (bytes.subarray(0, 8).equals(PNG_MAGIC)) {
-    kind = "PNG";
-    size = pngSize(bytes);
-  } else if (bytes.subarray(0, 3).equals(JPEG_MAGIC)) {
-    kind = "JPEG";
-    if (bytes[bytes.length - 2] !== 0xff || bytes[bytes.length - 1] !== 0xd9) {
-      fail("JPEG data is missing its end marker (FF D9)");
+  if (isJpeg) {
+    if (buf[buf.length - 2] !== 0xff || buf[buf.length - 1] !== 0xd9) {
+      fail("entry.png is not a whole JPEG: end marker missing");
     }
-    size = jpegSize(bytes);
-  } else {
-    fail("entry.png is neither PNG nor JPEG (magic bytes do not match)");
+    const d = jpegDimensions(buf);
+    if (!d) fail("entry.png is not a whole JPEG: no SOF frame found");
+    return { kind: "JPEG", ...d };
   }
-  if (size.width <= 0 || size.height <= 0) fail(`bad image size ${size.width}x${size.height}`);
-  if (size.width > MAX_SIDE || size.height > MAX_SIDE) {
-    fail(`image is ${size.width}x${size.height}, over the 1024x1024 limit`);
-  }
-
-  const outDir = process.env.MAKEFUN_OUTPUT_DIR || "/output";
-  mkdirSync(outDir, { recursive: true });
-  const dest = join(outDir, "entry.png");
-  writeFileSync(dest, bytes);
-
-  const back = readFileSync(dest);
-  if (!back.equals(bytes)) fail("output differs from entry.png after writing");
-
-  console.log(`entry.png: ${size.width}x${size.height} ${kind} ${bytes.length} bytes -> ${dest}`);
+  fail("entry.png has unknown magic bytes: not PNG or JPEG");
 }
 
-main();
+const scriptDir = dirname(fileURLToPath(import.meta.url));
+const source = join(scriptDir, "entry.png");
+const outDir = (process.env.MAKEFUN_OUTPUT_DIR || "").trim() || "/output";
+const target = join(outDir, "entry.png");
+
+if (!existsSync(source)) fail(`source image not found: ${source}`);
+const data = readFileSync(source);
+if (data.length === 0) fail("entry.png is empty");
+if (data.length > MAX_BYTES) fail(`entry.png is ${data.length} bytes, over the 1048576 byte limit`);
+const info = describe(data);
+if (info.width > MAX_DIM || info.height > MAX_DIM) {
+  fail(`entry.png is ${info.width}x${info.height}, over the 1024x1024 limit`);
+}
+
+mkdirSync(outDir, { recursive: true });
+copyFileSync(source, target);
+
+const written = readFileSync(target);
+if (!written.equals(data)) fail("output differs from source after copy");
+const outInfo = describe(written);
+if (outInfo.width !== info.width || outInfo.height !== info.height) {
+  fail(`output dimensions ${outInfo.width}x${outInfo.height} differ from source ${info.width}x${info.height}`);
+}
+if (written.length > MAX_BYTES) fail(`output is ${written.length} bytes, over the 1048576 byte limit`);
+const stat = statSync(target);
+console.log(`wrote ${target}: ${info.kind} ${info.width}x${info.height}, ${stat.size} bytes, verified byte-identical`);
